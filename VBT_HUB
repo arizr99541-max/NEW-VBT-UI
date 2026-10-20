@@ -1,0 +1,833 @@
+-- =============================================
+-- VBT_SASUKE HUB | VOXELS GOD EDITION (MINECRAFT STYLE UI)
+-- Converted to match Voxel's God / Minecraft style interface
+-- =============================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+
+-- Helper function to send chat messages
+local function sendChatMessage(message)
+    pcall(function()
+        local textChatService = game:GetService("TextChatService")
+        if textChatService.ChatInputBarConfiguration.TargetTextChannel then
+            textChatService.ChatInputBarConfiguration.TargetTextChannel:SendAsync(message)
+        else
+            game:GetService("ReplicatedStorage"):WaitForChild("DefaultChatSystemChatEvents"):WaitForChild("SayMessageRequest"):FireServer(message, "All")
+        end
+    end)
+end
+
+-- =============================================
+-- SCRIPT 1: KILL AURA LOGIC & CONFIG
+-- =============================================
+local AURA_CONFIG = {
+    Enabled = false,
+    Range = 27,
+    MaxAttacksPerSecond = 10,
+    BurstSize = 2,
+    ScanInterval = 0,
+    TargetPlayers = true,
+    TargetNPCs = true,
+}
+
+local AttackRemote = nil
+local isAuraRemoteEvent = false
+
+local function findAttackRemote()
+    local possiblePaths = {
+        ReplicatedStorage:FindFirstChild("Systems") and ReplicatedStorage.Systems:FindFirstChild("ActionsSystem") and ReplicatedStorage.Systems.ActionsSystem.Network:FindFirstChild("Attack"),
+        ReplicatedStorage:FindFirstChild("Systems") and ReplicatedStorage.Systems:FindFirstChild("Combat") and ReplicatedStorage.Systems.Combat:FindFirstChild("Attack"),
+        ReplicatedStorage:FindFirstChild("Combat") and ReplicatedStorage.Combat:FindFirstChild("Attack"),
+        ReplicatedStorage:FindFirstChild("Game") and ReplicatedStorage.Game:FindFirstChild("Attack"),
+        ReplicatedStorage:FindFirstChild("Attack"),
+        ReplicatedStorage:FindFirstChild("Remote") and ReplicatedStorage.Remote:FindFirstChild("Attack"),
+    }
+    for _, remote in ipairs(possiblePaths) do
+        if remote and (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")) then
+            return remote
+        end
+    end
+    local function deepScan(folder)
+        for _, child in folder:GetChildren() do
+            if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+                local lowerName = child.Name:lower()
+                if lowerName:find("attack") or lowerName:find("combat") or lowerName:find("damage") or lowerName:find("hit") then
+                    return child
+                end
+            end
+            if child:IsA("Folder") or child:IsA("Model") then
+                local found = deepScan(child)
+                if found then return found end
+            end
+        end
+        return nil
+    end
+    return deepScan(ReplicatedStorage)
+end
+
+AttackRemote = findAttackRemote()
+if AttackRemote then
+    isAuraRemoteEvent = AttackRemote:IsA("RemoteEvent")
+end
+
+local EntityManager = {
+    cache = {},
+    lastScan = 0,
+    refresh = function(self)
+        local newCache = {}
+        if AURA_CONFIG.TargetPlayers then
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer then
+                    local char = player.Character
+                    if char and char:FindFirstChild("HumanoidRootPart") and char:FindFirstChild("Humanoid") and char.Humanoid.Health > 0 then
+                        table.insert(newCache, { character = char, hrp = char.HumanoidRootPart, humanoid = char.Humanoid, type = "player" })
+                    end
+                end
+            end
+        end
+        if AURA_CONFIG.TargetNPCs then
+            for _, child in Workspace:GetChildren() do
+                if child:IsA("Model") and child ~= LocalPlayer.Character and not Players:GetPlayerFromCharacter(child) then
+                    local hrp = child:FindFirstChild("HumanoidRootPart")
+                    local hum = child:FindFirstChild("Humanoid")
+                    if hrp and hum and hum.Health > 0 then
+                        table.insert(newCache, { character = child, hrp = hrp, humanoid = hum, type = "npc" })
+                    end
+                end
+            end
+        end
+        self.cache = newCache
+        self.lastScan = tick()
+    end,
+    getNearest = function(self, origin, maxDist)
+        local best = nil
+        local bestDist = maxDist * maxDist
+        for _, target in ipairs(self.cache) do
+            if target.hrp and target.hrp.Parent then
+                local dx = target.hrp.Position.X - origin.X
+                local dy = target.hrp.Position.Y - origin.Y
+                local dz = target.hrp.Position.Z - origin.Z
+                local distSq = dx*dx + dy*dy + dz*dz
+                if distSq < bestDist then
+                    bestDist = distSq
+                    best = target
+                end
+            end
+        end
+        return best
+    end
+}
+
+local auraLastAttackTime = 0
+local auraAttackCounter = 0
+local auraRateLimitHit = false
+local auraRateLimitRecoveryTime = 0
+
+local function sendAttack(target)
+    if not AttackRemote or not target or not target.character then return false end
+    if auraRateLimitHit then
+        if tick() - auraRateLimitRecoveryTime < 3 then return false else auraRateLimitHit = false end
+    end
+    local now = tick()
+    local timeBetweenAttacks = 1 / AURA_CONFIG.MaxAttacksPerSecond
+    if now - auraLastAttackTime < timeBetweenAttacks then return false end
+
+    local attempts = {
+        function() if isAuraRemoteEvent then AttackRemote:FireServer(target.character, 1) else AttackRemote:InvokeServer(target.character, 1) end end,
+        function() if isAuraRemoteEvent then AttackRemote:FireServer(target.character, target.humanoid, 1) else AttackRemote:InvokeServer(target.character, target.humanoid, 1) end end,
+        function() if isAuraRemoteEvent then AttackRemote:FireServer(target.hrp, 1) else AttackRemote:InvokeServer(target.hrp, 1) end end,
+        function() if isAuraRemoteEvent then AttackRemote:FireServer(target.character, 10) else AttackRemote:InvokeServer(target.character, 10) end end,
+        function() if isAuraRemoteEvent then AttackRemote:FireServer(target.character) else AttackRemote:InvokeServer(target.character) end end
+    }
+
+    local success = false
+    for _, attempt in ipairs(attempts) do
+        local result, err = pcall(attempt)
+        if result then
+            success = true
+            auraLastAttackTime = now
+            auraAttackCounter = auraAttackCounter + 1
+            break
+        else
+            if err and string.find(tostring(err):lower(), "rate") then
+                auraRateLimitHit = true
+                auraRateLimitRecoveryTime = now
+                break
+            end
+        end
+    end
+    return success
+end
+
+local function attackLoop()
+    if not AURA_CONFIG.Enabled then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    if tick() - EntityManager.lastScan > AURA_CONFIG.ScanInterval then
+        EntityManager:refresh()
+    end
+
+    local target = EntityManager:getNearest(hrp.Position, AURA_CONFIG.Range)
+    if not target then return end
+
+    for i = 1, AURA_CONFIG.BurstSize do
+        if sendAttack(target) then
+            if i < AURA_CONFIG.BurstSize then task.wait(0.03) end
+        else
+            break
+        end
+    end
+end
+RunService.Heartbeat:Connect(attackLoop)
+
+-- =============================================
+-- SCRIPT 2: GOD MODE / EATER V10 LOGIC & CONFIG
+-- =============================================
+local EATER_CONFIG = {
+    Enabled = false,
+    EatsPerFrame = 6,
+    MaxSlot = 36,
+}
+
+local ConsumeRemote = ReplicatedStorage:FindFirstChild("Systems") and ReplicatedStorage.Systems:FindFirstChild("ActionsSystem") and ReplicatedStorage.Systems.ActionsSystem:FindFirstChild("Network") and ReplicatedStorage.Systems.ActionsSystem.Network:FindFirstChild("Consume")
+local totalEaten = 0
+local speedTimer = 0
+local speedCounter = 0
+local slotIndex = 1
+local eaterConnection = nil
+local currentEatsPerSec = 0
+
+local function ResetEat()
+    slotIndex = 1
+end
+
+local function SetupHealthMonitor(char)
+    local hum = char:WaitForChild("Humanoid", 3)
+    if hum then
+        hum.HealthChanged:Connect(function(newHealth)
+            if newHealth <= 0 then ResetEat() end
+        end)
+    end
+end
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    ResetEat()
+    SetupHealthMonitor(char)
+end)
+if LocalPlayer.Character then
+    SetupHealthMonitor(LocalPlayer.Character)
+end
+
+local function OptimizedEat()
+    if not EATER_CONFIG.Enabled or not ConsumeRemote then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hum = char:FindFirstChild("Humanoid")
+    if not hum or hum.Health <= 0 then
+        ResetEat()
+        return
+    end
+
+    for i = 1, EATER_CONFIG.EatsPerFrame do
+        local slot = slotIndex
+        task.spawn(function()
+            pcall(function()
+                ConsumeRemote:InvokeServer(slot)
+            end)
+        end)
+        totalEaten = totalEaten + 1
+        speedCounter = speedCounter + 1
+        slotIndex = slotIndex + 1
+        if slotIndex > EATER_CONFIG.MaxSlot then
+            slotIndex = 1
+        end
+    end
+
+    speedTimer = speedTimer + 1
+    if speedTimer >= 30 then
+        currentEatsPerSec = speedCounter * 2
+        speedCounter = 0
+        speedTimer = 0
+    end
+end
+
+-- =============================================
+-- SCRIPT 3: MOVEMENT, VISUALS & EXTRA FEATURES
+-- =============================================
+local UTILS_CONFIG = {
+    WalkSpeed = 16,
+    SpeedEnabled = false,
+    InfJumpEnabled = false,
+    NoclipEnabled = false,
+    ESPEnabled = false,
+    WaypointESPEnabled = false,
+    NoDamageEffect = false,
+}
+
+local noclipConnection = nil
+
+RunService.Stepped:Connect(function()
+    if UTILS_CONFIG.SpeedEnabled then
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum.WalkSpeed = UTILS_CONFIG.WalkSpeed end
+        end
+    end
+end)
+
+UserInputService.JumpRequest:Connect(function()
+    if UTILS_CONFIG.InfJumpEnabled then
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+        end
+    end
+end)
+
+local function toggleNoclip(state)
+    UTILS_CONFIG.NoclipEnabled = state
+    if state then
+        if not noclipConnection then
+            noclipConnection = RunService.Stepped:Connect(function()
+                local char = LocalPlayer.Character
+                if char then
+                    for _, part in ipairs(char:GetDescendants()) do
+                        if part:IsA("BasePart") then part.CanCollide = false end
+                    end
+                end
+            end)
+        end
+    else
+        if noclipConnection then
+            noclipConnection:Disconnect()
+            noclipConnection = nil
+        end
+    end
+end
+
+local espFolder = Instance.new("Folder")
+espFolder.Name = "VBTPlayerESP"
+espFolder.Parent = CoreGui
+
+local function applyPlayerESP(player)
+    if player == LocalPlayer then return end
+    local function addHighlight(char)
+        if not char then return end
+        local oldHL = espFolder:FindFirstChild(player.Name)
+        if oldHL then oldHL:Destroy() end
+        if UTILS_CONFIG.ESPEnabled then
+            local hl = Instance.new("Highlight")
+            hl.Name = player.Name
+            hl.Adornee = char
+            hl.FillColor = Color3.fromRGB(186, 85, 211)
+            hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+            hl.FillTransparency = 0.3
+            hl.OutlineTransparency = 0
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Parent = espFolder
+        end
+    end
+    if player.Character then addHighlight(player.Character) end
+    player.CharacterAdded:Connect(function(char)
+        task.wait(0.5)
+        addHighlight(char)
+    end)
+end
+
+local function togglePlayerESP(state)
+    UTILS_CONFIG.ESPEnabled = state
+    espFolder:ClearAllChildren()
+    if state then
+        for _, player in ipairs(Players:GetPlayers()) do applyPlayerESP(player) end
+    end
+end
+
+Players.PlayerAdded:Connect(function(player)
+    if UTILS_CONFIG.ESPEnabled then applyPlayerESP(player) end
+end)
+Players.PlayerRemoving:Connect(function(player)
+    local oldHL = espFolder:FindFirstChild(player.Name)
+    if oldHL then oldHL:Destroy() end
+end)
+
+local wpFolder = Instance.new("Folder")
+wpFolder.Name = "VBTWaypointESP"
+wpFolder.Parent = CoreGui
+
+local function applyWaypointESP(player)
+    if player == LocalPlayer then return end
+    local function createBillboard(char)
+        if not char then return end
+        local hrp = char:WaitForChild("HumanoidRootPart", 3)
+        if not hrp then return end
+        local oldBB = wpFolder:FindFirstChild(player.Name .. "_WP")
+        if oldBB then oldBB:Destroy() end
+        if UTILS_CONFIG.WaypointESPEnabled then
+            local bb = Instance.new("BillboardGui")
+            bb.Name = player.Name .. "_WP"
+            bb.Adornee = hrp
+            bb.Size = UDim2.new(0, 150, 0, 35)
+            bb.AlwaysOnTop = true
+            bb.Parent = wpFolder
+
+            local label = Instance.new("TextLabel")
+            label.Size = UDim2.new(1, 0, 1, 0)
+            label.BackgroundTransparency = 1
+            label.TextColor3 = Color3.fromRGB(255, 255, 255)
+            label.TextStrokeTransparency = 0
+            label.Font = Enum.Font.Code
+            label.TextSize = 12
+            label.Parent = bb
+
+            task.spawn(function()
+                while UTILS_CONFIG.WaypointESPEnabled and char and char.Parent and hrp and hrp.Parent do
+                    local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                    if myHRP then
+                        local dist = math.floor((hrp.Position - myHRP.Position).Magnitude)
+                        label.Text = string.format("[VBT_SASUKE] %s\n[%d Studs]", player.DisplayName, dist)
+                    end
+                    task.wait(0.2)
+                end
+                bb:Destroy()
+            end)
+        end
+    end
+    if player.Character then createBillboard(player.Character) end
+    player.CharacterAdded:Connect(function(char)
+        task.wait(0.5)
+        createBillboard(char)
+    end)
+end
+
+local function toggleWaypointESP(state)
+    UTILS_CONFIG.WaypointESPEnabled = state
+    wpFolder:ClearAllChildren()
+    if state then
+        for _, player in ipairs(Players:GetPlayers()) do applyWaypointESP(player) end
+    end
+end
+
+task.spawn(function()
+    while task.wait(1) do
+        if UTILS_CONFIG.NoDamageEffect then
+            pcall(function()
+                local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+                if gui then
+                    for _, v in ipairs(gui:GetDescendants()) do
+                        local name = v.Name:lower()
+                        if name:find("blood") or name:find("vignette") or name:find("damage") or name:find("hit") or name:find("hurt") then
+                            if v:IsA("GuiObject") then v.Visible = false end
+                        end
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+-- =============================================
+-- CUSTOM MINECRAFT-STYLE GUI (VBT_SASUKE HUB THEME)
+-- =============================================
+if CoreGui:FindFirstChild("VBTSasukeHubUI") then
+    CoreGui.VBTSasukeHubUI:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "VBTSasukeHubUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = CoreGui
+
+-- Floating Flash Button (Smaller & Fully Rounded / Circular)
+local FlashButton = Instance.new("TextButton")
+FlashButton.Name = "FlashButton"
+FlashButton.Size = UDim2.new(0, 36, 0, 36)
+FlashButton.Position = UDim2.new(0, 15, 0.5, -18)
+FlashButton.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+FlashButton.Text = "⚡"
+FlashButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+FlashButton.TextSize = 16
+FlashButton.Visible = false
+FlashButton.Active = true
+FlashButton.Draggable = true
+FlashButton.Parent = ScreenGui
+
+local FlashCorner = Instance.new("UICorner")
+FlashCorner.CornerRadius = UDim.new(1, 0) -- Fully circular
+FlashCorner.Parent = FlashButton
+
+local FlashStroke = Instance.new("UIStroke")
+FlashStroke.Color = Color3.fromRGB(255, 215, 0)
+FlashStroke.Thickness = 2
+FlashStroke.Parent = FlashButton
+
+-- Main Container Window
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 620, 0, 380)
+MainFrame.Position = UDim2.new(0.5, -310, 0.5, -190)
+MainFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 24)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Parent = ScreenGui
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 6)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(60, 60, 60)
+MainStroke.Thickness = 2
+MainStroke.Parent = MainFrame
+
+-- Top Title Bar
+local TopBar = Instance.new("Frame")
+TopBar.Size = UDim2.new(1, 0, 0, 35)
+TopBar.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+
+local TopBarCorner = Instance.new("UICorner")
+TopBarCorner.CornerRadius = UDim.new(0, 6)
+TopBarCorner.Parent = TopBar
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(0, 250, 1, 0)
+TitleLabel.Position = UDim2.new(0, 12, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "VBT_SASUKE HUB"
+TitleLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+TitleLabel.TextSize = 14
+TitleLabel.Font = Enum.Font.Code
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TopBar
+
+-- Close / Minimize Button (-)
+local CloseButton = Instance.new("TextButton")
+CloseButton.Size = UDim2.new(0, 30, 0, 24)
+CloseButton.Position = UDim2.new(1, -38, 0, 5)
+CloseButton.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+CloseButton.Text = "-"
+CloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+CloseButton.TextSize = 16
+CloseButton.Font = Enum.Font.Code
+CloseButton.Parent = TopBar
+
+local CloseCorner = Instance.new("UICorner")
+CloseCorner.CornerRadius = UDim.new(0, 4)
+CloseCorner.Parent = CloseButton
+
+local uiVisible = true
+local function toggleUI(visible)
+    uiVisible = visible
+    MainFrame.Visible = uiVisible
+    FlashButton.Visible = not uiVisible
+end
+
+CloseButton.MouseButton1Click:Connect(function()
+    toggleUI(false)
+end)
+
+FlashButton.MouseButton1Click:Connect(function()
+    toggleUI(true)
+end)
+
+-- Sidebar Navigation (Tabs)
+local Sidebar = Instance.new("Frame")
+Sidebar.Size = UDim2.new(0, 150, 1, -35)
+Sidebar.Position = UDim2.new(0, 0, 0, 35)
+Sidebar.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+Sidebar.BorderSizePixel = 0
+Sidebar.Parent = MainFrame
+
+local function createTabButton(name, posY, active)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -16, 0, 32)
+    btn.Position = UDim2.new(0, 8, 0, posY)
+    btn.BackgroundColor3 = active and Color3.fromRGB(45, 45, 45) or Color3.fromRGB(28, 28, 28)
+    btn.Text = "  " .. name
+    btn.TextColor3 = active and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(160, 160, 160)
+    btn.TextSize = 13
+    btn.Font = Enum.Font.Code
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.Parent = Sidebar
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = btn
+    return btn
+end
+
+local btnMain = createTabButton("Main", 12, true)
+local btnPro = createTabButton("Pro", 50, false)
+local btnScript = createTabButton("Other Voxel Script", 88, false)
+local btnInfo = createTabButton("Info", 126, false)
+
+-- Content Area Containers
+local Container = Instance.new("Frame")
+Container.Size = UDim2.new(1, -155, 1, -45)
+Container.Position = UDim2.new(0, 153, 0, 40)
+Container.BackgroundTransparency = 1
+Container.Parent = MainFrame
+
+local function createContentPanel()
+    local sf = Instance.new("ScrollingFrame")
+    sf.Size = UDim2.new(1, 0, 1, 0)
+    sf.BackgroundTransparency = 1
+    sf.BorderSizePixel = 0
+    sf.CanvasSize = UDim2.new(0, 0, 0, 500)
+    sf.ScrollBarThickness = 4
+    sf.Visible = false
+    sf.Parent = Container
+    return sf
+end
+
+local panelMain = createContentPanel()
+panelMain.Visible = true
+local panelPro = createContentPanel()
+local panelScript = createContentPanel()
+local panelInfo = createContentPanel()
+
+local function switchTab(activeBtn, activePanel)
+    for _, p in ipairs({panelMain, panelPro, panelScript, panelInfo}) do p.Visible = false end
+    for _, b in ipairs({btnMain, btnPro, btnScript, btnInfo}) do
+        b.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+        b.TextColor3 = Color3.fromRGB(160, 160, 160)
+    end
+    activeBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    activeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    activePanel.Visible = true
+end
+
+btnMain.MouseButton1Click:Connect(function() switchTab(btnMain, panelMain) end)
+btnPro.MouseButton1Click:Connect(function() switchTab(btnPro, panelPro) end)
+btnScript.MouseButton1Click:Connect(function() switchTab(btnScript, panelScript) end)
+btnInfo.MouseButton1Click:Connect(function() switchTab(btnInfo, panelInfo) end)
+
+-- UI Element Helpers for Minecraft Style
+local function addSectionHeader(parent, text, posY)
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -20, 0, 25)
+    label.Position = UDim2.new(0, 10, 0, posY)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(200, 200, 200)
+    label.TextSize = 13
+    label.Font = Enum.Font.Code
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = parent
+end
+
+local function addToggle(parent, text, initialState, posY, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -20, 0, 36)
+    frame.Position = UDim2.new(0, 10, 0, posY)
+    frame.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
+    frame.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -55, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(230, 230, 230)
+    label.TextSize = 12
+    label.Font = Enum.Font.Code
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 28, 0, 22)
+    toggleBtn.Position = UDim2.new(1, -36, 0.5, -11)
+    toggleBtn.BackgroundColor3 = initialState and Color3.fromRGB(70, 160, 70) or Color3.fromRGB(50, 50, 50)
+    toggleBtn.Text = ""
+    toggleBtn.Parent = frame
+
+    local tCorner = Instance.new("UICorner")
+    tCorner.CornerRadius = UDim.new(0, 4)
+    tCorner.Parent = toggleBtn
+
+    local state = initialState
+    toggleBtn.MouseButton1Click:Connect(function()
+        state = not state
+        toggleBtn.BackgroundColor3 = state and Color3.fromRGB(70, 160, 70) or Color3.fromRGB(50, 50, 50)
+        callback(state)
+    end)
+
+    return {
+        Set = function(val)
+            state = val
+            toggleBtn.BackgroundColor3 = state and Color3.fromRGB(70, 160, 70) or Color3.fromRGB(50, 50, 50)
+            callback(state)
+        end
+    }
+end
+
+local function addSlider(parent, text, min, max, current, suffix, posY, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -20, 0, 50)
+    frame.Position = UDim2.new(0, 10, 0, posY)
+    frame.BackgroundColor3 = Color3.fromRGB(32, 32, 32)
+    frame.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 4)
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -20, 0, 22)
+    label.Position = UDim2.new(0, 12, 0, 4)
+    label.BackgroundTransparency = 1
+    label.Text = string.format("%s: %d %s", text, current, suffix)
+    label.TextColor3 = Color3.fromRGB(230, 230, 230)
+    label.TextSize = 12
+    label.Font = Enum.Font.Code
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local sliderBg = Instance.new("Frame")
+    sliderBg.Size = UDim2.new(1, -24, 0, 8)
+    sliderBg.Position = UDim2.new(0, 12, 0, 32)
+    sliderBg.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    sliderBg.Parent = frame
+
+    local sCorner = Instance.new("UICorner")
+    sCorner.CornerRadius = UDim.new(0, 4)
+    sCorner.Parent = sliderBg
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((current - min) / (max - min), 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(120, 120, 220)
+    fill.Parent = sliderBg
+
+    local fCorner = Instance.new("UICorner")
+    fCorner.CornerRadius = UDim.new(0, 4)
+    fCorner.Parent = fill
+
+    local dragging = false
+    sliderBg.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            local pos = math.clamp((input.Position.X - sliderBg.AbsolutePosition.X) / sliderBg.AbsoluteSize.X, 0, 1)
+            local val = math.floor(min + (max - min) * pos)
+            fill.Size = UDim2.new(pos, 0, 1, 0)
+            label.Text = string.format("%s: %d %s", text, val, suffix)
+            callback(val)
+        end
+    end)
+end
+
+-- POPULATE MAIN TAB
+addSectionHeader(panelMain, "Main Cheats", 10)
+local auraToggleRef = addToggle(panelMain, "Kill Aura (Susanoo Slash)", false, 40, function(Value)
+    AURA_CONFIG.Enabled = Value
+    if Value then
+        EntityManager:refresh()
+        auraRateLimitHit = false
+        sendChatMessage("[VBT_SASUKE Hub]: Kill Aura Enabled 💜⚔️")
+    else
+        sendChatMessage("[VBT_SASUKE Hub]: Kill Aura Disabled ❌")
+    end
+end)
+
+local godToggleRef = addToggle(panelMain, "Godmode / Auto Eater (Susanoo Armor)", false, 82, function(Value)
+    EATER_CONFIG.Enabled = Value
+    if Value then
+        ResetEat()
+        speedCounter = 0
+        speedTimer = 0
+        if eaterConnection then eaterConnection:Disconnect() end
+        eaterConnection = RunService.Heartbeat:Connect(OptimizedEat)
+        sendChatMessage("[VBT_SASUKE Hub]: Susanoo Armor Enabled 🛡️💜")
+    else
+        if eaterConnection then eaterConnection:Disconnect() eaterConnection = nil end
+        ResetEat()
+        currentEatsPerSec = 0
+        sendChatMessage("[VBT_SASUKE Hub]: Susanoo Armor Disabled ❌")
+    end
+end)
+
+addToggle(panelMain, "No Fall Damage / No Drown", false, 124, function(Value)
+    UTILS_CONFIG.NoDamageEffect = Value
+end)
+
+addToggle(panelMain, "VBT_SASUKE / Susanoo Chams ESP", false, 166, function(Value)
+    togglePlayerESP(Value)
+end)
+
+addToggle(panelMain, "Multiverse Hub / Waypoint ESP", false, 208, function(Value)
+    toggleWaypointESP(Value)
+end)
+
+-- POPULATE PRO TAB (MOVEMENT & COMBAT CONFIGS)
+addSectionHeader(panelPro, "Pro Configurations", 10)
+addSlider(panelPro, "Attack Range", 5, 100, AURA_CONFIG.Range, "Studs", 40, function(v) AURA_CONFIG.Range = v end)
+addSlider(panelPro, "Attacks Per Second", 1, 30, AURA_CONFIG.MaxAttacksPerSecond, "APS", 98, function(v) AURA_CONFIG.MaxAttacksPerSecond = v end)
+addSlider(panelPro, "Eats Per Frame", 1, 20, EATER_CONFIG.EatsPerFrame, "Eats", 156, function(v) EATER_CONFIG.EatsPerFrame = v end)
+
+-- POPULATE OTHER VOXEL SCRIPT TAB (MOVEMENT & UTILITIES)
+addSectionHeader(panelScript, "Movement Utilities", 10)
+addToggle(panelScript, "WalkSpeed Hack (Body Flicker)", false, 40, function(Value)
+    UTILS_CONFIG.SpeedEnabled = Value
+    if not Value then
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum.WalkSpeed = 16 end
+        end
+    end
+end)
+addSlider(panelScript, "WalkSpeed Value", 16, 200, UTILS_CONFIG.WalkSpeed, "Speed", 82, function(v) UTILS_CONFIG.WalkSpeed = v end)
+addToggle(panelScript, "Infinite Jump (Air Walk)", false, 140, function(Value) UTILS_CONFIG.InfJumpEnabled = Value end)
+addToggle(panelScript, "Noclip (Phase Through Walls)", false, 182, function(Value) toggleNoclip(Value) end)
+
+-- POPULATE INFO TAB
+addSectionHeader(panelInfo, "Hub Information", 10)
+local infoLabel = Instance.new("TextLabel")
+infoLabel.Size = UDim2.new(1, -20, 0, 100)
+infoLabel.Position = UDim2.new(0, 10, 0, 40)
+infoLabel.BackgroundTransparency = 1
+infoLabel.Text = "VBT_SASUKE HUB | Voxels God Edition\nEdition: Sasuke Susanoo Theme\nHotkeys: [O] Toggle Aura, [K] Toggle Godmode, [R] Reset Eat Slot\nCreated for high-performance combat & utility management."
+infoLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+infoLabel.TextSize = 12
+infoLabel.Font = Enum.Font.Code
+infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+infoLabel.TextYAlignment = Enum.TextYAlignment.Top
+infoLabel.TextWrapped = true
+infoLabel.Parent = panelInfo
+
+-- =============================================
+-- KEYBOARD HOTKEYS SETUP
+-- =============================================
+UserInputService.InputBegan:Connect(function(Input, GameProcessed)
+    if GameProcessed then return end
+    if Input.KeyCode == Enum.KeyCode.O then
+        auraToggleRef.Set(not AURA_CONFIG.Enabled)
+    elseif Input.KeyCode == Enum.KeyCode.K then
+        godToggleRef.Set(not EATER_CONFIG.Enabled)
+    elseif Input.KeyCode == Enum.KeyCode.R then
+        ResetEat()
+    end
+end)
+
+sendChatMessage("[VBT_SASUKE Hub]: Successfully loaded! 💜⚔️")
